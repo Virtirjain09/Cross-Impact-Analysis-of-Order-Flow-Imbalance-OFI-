@@ -9,7 +9,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-api_key = 'db-CCKfSfrXjksnbTah9KHDQridasBYu'
+api_key = '"your API key"'
 
 client = databento.Historical(api_key)
 
