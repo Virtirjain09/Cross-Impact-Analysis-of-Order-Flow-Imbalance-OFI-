@@ -1,0 +1,301 @@
+import databento
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+
+warnings.filterwarnings("ignore")
+
+api_key = 'db-CCKfSfrXjksnbTah9KHDQridasBYu'
+
+client = databento.Historical(api_key)
+
+# Specify dataset parameters
+dataset = 'XNAS.ITCH'
+symbols = ['AAPL', 'MSFT', 'NVDA', 'AMGN', 'GILD', 'TSLA', 'PEP', 'JPM', 'V', 'XOM']
+start_date = '2022-01-01'
+end_date = '2022-01-31'
+
+# Fetch data
+data = client.timeseries.get_range(
+    dataset=dataset,
+    schema='mbp-10',
+    start=start_date,
+    end=end_date,
+    limit=100_000,
+    symbols=",".join(symbols)
+)
+
+
+data.to_csv('order_book_data.csv')
+
+# Load the data
+data = pd.read_csv('order_book_data.csv')
+
+# Data Cleaning
+data.dropna(inplace=True)
+data['timestamp'] = pd.to_datetime(data['ts_recv'])
+data.sort_values(by=['symbol', 'timestamp'], inplace=True)
+data.drop_duplicates(inplace=True)
+
+# Multi-level OFI calculation
+
+def calculate_mlofi(group, levels=5):
+    mlofi = pd.DataFrame(index=group.index)
+    mlofi['symbol'] = group['symbol']
+    for i in range(levels):
+        bid_col = f'bid_sz_{i:02d}'
+        ask_col = f'ask_sz_{i:02d}'
+        mlofi[f'ofi_{i}'] = group[bid_col].diff().fillna(0) - group[ask_col].diff().fillna(0)
+    return mlofi
+
+
+ofi_data = data.groupby('symbol', group_keys=False).apply(calculate_mlofi).reset_index()
+
+print(ofi_data.columns)
+
+def apply_pca(group):
+    ofi_features = [f'ofi_{i}' for i in range(5)]
+    pca = PCA(n_components=1)
+    group_clean = group[ofi_features].dropna()
+    if len(group_clean) > 0:
+        group['ofi_pca'] = pd.Series(pca.fit_transform(group_clean).flatten(), index=group_clean.index)
+        print(f"PCA applied for symbol {group['symbol'].iloc[0]}: {group['ofi_pca']}")
+    else:
+        group['ofi_pca'] = np.nan
+    return group
+
+print(ofi_data.columns)
+print(ofi_data.head())
+
+# Now apply PCA after ensuring that the MLOFI columns exist
+ofi_data = ofi_data.groupby('symbol', group_keys=False).apply(apply_pca).reset_index(drop=False)
+
+def calculate_price_changes(group):
+    group['price_change'] = group['ofi_pca'].diff()
+    group['future_price_change_1min'] = group['ofi_pca'].diff().shift(-60)  # Assuming 1-second intervals
+    group['future_price_change_5min'] = group['ofi_pca'].diff().shift(-300)
+    return group
+
+ofi_data = ofi_data.groupby('symbol', group_keys=False).apply(calculate_price_changes).reset_index(drop=True)
+
+# Calculate lagged OFI
+ofi_data['ofi_lagged'] = ofi_data.groupby('symbol')['ofi_pca'].shift(1)
+
+# Remove rows with NaN values in important columns
+important_columns = ['ofi_pca', 'price_change', 'future_price_change_1min', 'future_price_change_5min', 'ofi_lagged']
+ofi_data_cleaned = ofi_data.dropna(subset=important_columns)
+
+print(ofi_data.isnull().sum())
+numeric_columns = ofi_data.select_dtypes(include=[np.number]).columns
+print(np.isinf(ofi_data[numeric_columns]).sum())
+ofi_data_cleaned[numeric_columns] = ofi_data_cleaned[numeric_columns].replace([np.inf, -np.inf], np.nan)
+
+# Remove rows with NaN values in important columns
+important_columns = ['price_change', 'future_price_change_1min', 'future_price_change_5min', 'ofi_lagged']
+ofi_data_cleaned = ofi_data.dropna(subset=important_columns)
+
+# Check for infinite values in numeric columns and replace them with NaN
+numeric_columns = ofi_data_cleaned.select_dtypes(include=[np.number]).columns
+ofi_data_cleaned[numeric_columns] = ofi_data_cleaned[numeric_columns].replace([np.inf, -np.inf], np.nan)
+
+# Remove any remaining rows with NaN values
+ofi_data_cleaned = ofi_data_cleaned.dropna()
+
+print(ofi_data_cleaned.isnull().sum())
+print(np.isinf(ofi_data_cleaned[numeric_columns]).sum())
+
+def run_regression(data, y_col, x_cols):
+    df = data[[y_col] + x_cols].copy()
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if df.empty:
+        print(f"No valid data for regression with y={y_col} and x={x_cols}")
+        return None
+
+    X = sm.add_constant(df[x_cols])
+    y = df[y_col]
+
+    model = sm.OLS(y, X).fit()
+    return model
+
+# Remove rows with inf or NaN values in important columns
+important_columns = ['ofi_pca', 'price_change', 'future_price_change_1min', 'future_price_change_5min', 'ofi_lagged']
+ofi_data_cleaned = ofi_data[important_columns].replace([np.inf, -np.inf], np.nan).dropna()
+
+print("Original shape:", ofi_data.shape)
+print("Cleaned shape:", ofi_data_cleaned.shape)
+
+# Contemporaneous model
+contemp_model = run_regression(ofi_data_cleaned, 'price_change', ['ofi_pca'])
+if contemp_model:
+    print("Contemporaneous Model:")
+    print(contemp_model.summary())
+
+# Predictive model (1-minute horizon)
+pred_model_1min = run_regression(ofi_data_cleaned, 'future_price_change_1min', ['ofi_lagged'])
+if pred_model_1min:
+    print("\nPredictive Model (1-minute horizon):")
+    print(pred_model_1min.summary())
+
+# Predictive model (5-minute horizon)
+pred_model_5min = run_regression(ofi_data_cleaned, 'future_price_change_5min', ['ofi_lagged'])
+if pred_model_5min:
+    print("\nPredictive Model (5-minute horizon):")
+    print(pred_model_5min.summary())
+
+important_columns = ['symbol', 'ofi_pca', 'price_change', 'future_price_change_1min', 'future_price_change_5min', 'ofi_lagged']
+
+numeric_columns = [col for col in important_columns if col != 'symbol']
+ofi_data_cleaned = ofi_data[important_columns].copy()
+ofi_data_cleaned[numeric_columns] = ofi_data_cleaned[numeric_columns].replace([np.inf, -np.inf], np.nan)
+ofi_data_cleaned = ofi_data_cleaned.dropna()
+
+# Check the shape of the cleaned dataset
+print("Original shape:", ofi_data.shape)
+print("Cleaned shape:", ofi_data_cleaned.shape)
+
+
+# Cross-impact analysis
+correlation_columns = [col for col in important_columns if col != 'symbol']
+correlation_matrix = ofi_data_cleaned.groupby('symbol')[correlation_columns].corr()
+
+# Visualize the correlation matrix
+plt.figure(figsize=(15, 12))
+sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f')
+plt.title('Cross-Impact Relationships')
+plt.tight_layout()
+plt.savefig('cross_impact_heatmap.png')
+plt.close()
+
+# Print the correlation matrix
+print(correlation_matrix)
+
+print(ofi_data_cleaned.describe())
+print(ofi_data_cleaned.dtypes)
+
+overall_correlation = ofi_data_cleaned[correlation_columns].corr()
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(overall_correlation, annot=True, cmap='coolwarm', fmt='.2f')
+plt.title('Overall Cross-Impact Relationships')
+plt.tight_layout()
+plt.savefig('overall_cross_impact_heatmap.png')
+plt.close()
+
+print("Overall Correlation Matrix:")
+print(overall_correlation)
+
+correlation_columns = ['ofi_pca', 'price_change', 'future_price_change_1min', 'future_price_change_5min', 'ofi_lagged']
+correlation_matrix = ofi_data_cleaned[correlation_columns].corr()
+
+plt.figure(figsize=(15, 10))
+sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt='.2f', mask=np.isnan(correlation_matrix))
+plt.title('Cross-Impact Relationships')
+plt.tight_layout()
+plt.savefig('cross_impact_heatmap.png')
+plt.show()
+
+print(ofi_data.columns)
+
+def cross_impact_analysis(data):
+    symbols = data['symbol'].unique()
+    impact_matrix = pd.DataFrame(index=symbols, columns=symbols, dtype=float)
+
+    for symbol1 in symbols:
+        for symbol2 in symbols:
+            try:
+                # Get data for both symbols
+                data1 = data[data['symbol'] == symbol1]['ofi_pca'].values
+                data2 = data[data['symbol'] == symbol2]['price_change'].values
+
+                # Ensure equal length for correlation
+                min_length = min(len(data1), len(data2))
+                if min_length > 0:
+                    # Calculate correlation between OFI and price changes
+                    correlation = np.corrcoef(data1[:min_length], data2[:min_length])[0,1]
+                    impact_matrix.loc[symbol1, symbol2] = correlation if np.isfinite(correlation) else np.nan
+                else:
+                    print(f"Insufficient data for {symbol1} and {symbol2}")
+                    impact_matrix.loc[symbol1, symbol2] = np.nan
+
+            except Exception as e:
+                print(f"Error calculating correlation between {symbol1} and {symbol2}: {e}")
+                impact_matrix.loc[symbol1, symbol2] = np.nan
+
+    return impact_matrix
+
+# Calculate cross-impact matrix
+cross_impact = cross_impact_analysis(ofi_data_cleaned)
+
+# Visualization of cross-impact relationships
+plt.figure(figsize=(15, 10))
+mask = np.isnan(cross_impact)
+sns.heatmap(cross_impact,
+            annot=True,
+            cmap='coolwarm',
+            fmt='.2f',
+            mask=mask,
+            center=0,
+            vmin=-1,
+            vmax=1)
+plt.title('Cross-Impact Analysis Between Stocks')
+plt.tight_layout()
+plt.savefig('cross_impact_heatmap.png')
+plt.show()
+
+#visualization: OFI trends over time
+plt.figure(figsize=(15, 10))
+for symbol in ofi_data_cleaned['symbol'].unique():
+    symbol_data = ofi_data_cleaned[ofi_data_cleaned['symbol'] == symbol]
+    plt.plot(range(len(symbol_data)), symbol_data['ofi_pca'], label=symbol, alpha=0.7)
+
+plt.title('OFI Trends Across Stocks')
+plt.xlabel('Time Index')
+plt.ylabel('OFI PCA')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.savefig('ofi_trends.png')
+plt.show()
+
+time_horizons = {
+    'Contemporaneous': 'price_change',
+    '1-min Future': 'future_price_change_1min',
+    '5-min Future': 'future_price_change_5min'
+}
+
+for horizon_name, column in time_horizons.items():
+    # Calculate correlations between stocks
+    correlations = pd.DataFrame(index=ofi_data_cleaned['symbol'].unique(),
+                              columns=ofi_data_cleaned['symbol'].unique(),
+                              dtype=float)
+
+    for symbol1 in correlations.index:
+        for symbol2 in correlations.columns:
+            data1 = ofi_data_cleaned[ofi_data_cleaned['symbol'] == symbol1]['ofi_pca']
+            data2 = ofi_data_cleaned[ofi_data_cleaned['symbol'] == symbol2][column]
+
+            # Ensure equal length for correlation calculation
+            min_length = min(len(data1), len(data2))
+            if min_length > 0:
+                correlation = data1[:min_length].corr(data2[:min_length])
+                correlations.loc[symbol1, symbol2] = correlation if np.isfinite(correlation) else np.nan
+
+
+    plt.figure(figsize=(15, 10))
+    mask = np.isnan(correlations)
+    sns.heatmap(correlations,
+                annot=True,
+                cmap='coolwarm',
+                fmt='.2f',
+                mask=mask,
+                center=0,
+                vmin=-1,
+                vmax=1)
+    plt.title(f'Cross-Impact Analysis for {horizon_name}')
+    plt.tight_layout()
+    plt.savefig(f'cross_impact_{horizon_name.lower()}.png')
+    plt.show()
