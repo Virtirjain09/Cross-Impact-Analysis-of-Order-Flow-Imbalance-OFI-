@@ -1,7 +1,6 @@
 # Cross-Impact-Analysis-of-Order-Flow-Imbalance-OFI-
 
 
-# Order Flow Imbalance and Cross-Impact Analysis
 
 ## Description
 This project analyzes order flow imbalance (OFI) metrics and cross-impact relationships in equity market data for highly liquid stocks.
