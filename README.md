@@ -8,7 +8,7 @@ This project analyzes order flow imbalance (OFI) metrics and cross-impact relati
 ## Steps to Run the Analysis
 1. Clone the repository
 2. Install required packages: `pip install -r requirements.txt`
-3. Run the Jupyter notebook in the `notebooks/` folder
+3. Run the Jupyter notebook in the `notebook/` folder
 
 ## Summary of Findings
 - Multi-level OFI metrics were calculated and integrated using PCA
@@ -17,7 +17,7 @@ This project analyzes order flow imbalance (OFI) metrics and cross-impact relati
 
 ## Folder Structure
 - `data/`: Placeholder for datasets
-- `notebooks/`: Jupyter notebooks for analysis
+- `notebook/`: Jupyter notebooks for analysis
 - `scripts/`: Modular Python scripts
 - `results/`: Output figures and analysis results
 
